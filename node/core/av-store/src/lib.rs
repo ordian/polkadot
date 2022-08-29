@@ -35,7 +35,7 @@ use bitvec::{order::Lsb0 as BitOrderLsb0, vec::BitVec};
 use polkadot_node_primitives::{AvailableData, ErasureChunk};
 use polkadot_node_subsystem::{
 	errors::{ChainApiError, RuntimeApiError},
-	messages::{AvailabilityStoreMessage, ChainApiMessage},
+	messages::{AvailabilityRecoveryMessage, AvailabilityStoreMessage, ChainApiMessage},
 	overseer, ActiveLeavesUpdate, FromOrchestra, OverseerSignal, SpawnedSubsystem, SubsystemError,
 };
 use polkadot_node_subsystem_util as util;
@@ -66,8 +66,8 @@ const TOMBSTONE_VALUE: &[u8] = &*b" ";
 /// Unavailable blocks are kept for 1 hour.
 const KEEP_UNAVAILABLE_FOR: Duration = Duration::from_secs(60 * 60);
 
-/// Finalized data is kept for 25 hours.
-const KEEP_FINALIZED_FOR: Duration = Duration::from_secs(25 * 60 * 60);
+/// Finalized data is kept for 12 hours.
+const KEEP_FINALIZED_FOR: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// The pruning interval.
 const PRUNING_INTERVAL: Duration = Duration::from_secs(60 * 5);
@@ -661,6 +661,8 @@ async fn process_new_head<Context>(
 	hash: Hash,
 	header: Header,
 ) -> Result<(), Error> {
+	const REQUESTER_LOG_TARGET: &str = "parachain::pov-requester";
+
 	let candidate_events = util::request_candidate_events(hash, ctx.sender()).await.await??;
 
 	// We need to request the number of validators based on the parent state,
@@ -688,8 +690,68 @@ async fn process_new_head<Context>(
 					config,
 					pruning_config,
 					(header.number, hash),
-					receipt,
+					receipt.clone(),
 				)?;
+
+				let (r_tx, r_rx) = oneshot::channel();
+
+				let session_index =
+					util::request_session_index_for_child(header.parent_hash, ctx.sender())
+						.await
+						.await??;
+
+				// TODO: consider supplying the backing group as an optimization
+				let candidate_hash = receipt.hash();
+				ctx.send_unbounded_message(AvailabilityRecoveryMessage::RecoverAvailableData(
+					receipt,
+					session_index,
+					None,
+					r_tx,
+				));
+
+				let mut sender = ctx.sender().clone();
+				let background = async move {
+					use polkadot_node_subsystem::SubsystemSender;
+
+					let available_data = match r_rx.await {
+						Err(error) => {
+							gum::warn!(
+								target: REQUESTER_LOG_TARGET,
+								?candidate_hash,
+								?error,
+								"PoV requester channel error",
+							);
+							return;
+						},
+						Ok(Ok(a)) => a,
+						Ok(Err(error)) => {
+							gum::warn!(
+								target: REQUESTER_LOG_TARGET,
+								?candidate_hash,
+								?error,
+								"PoV requester recovery error",
+							);
+							return;
+						},
+					};
+
+					let (self_tx, _self_rx) = oneshot::channel();
+					gum::info!(
+						target: REQUESTER_LOG_TARGET,
+						?candidate_hash,
+						"PoV requester saving data",
+					);
+					// Instead of calling `store_available_data` directly, we send a message
+					// to ourselves in order to avoid lifetime issues.
+					sender.send_unbounded_message(AvailabilityStoreMessage::StoreAvailableData {
+						candidate_hash,
+						n_validators: n_validators as _,
+						available_data,
+						tx: self_tx,
+					});
+				};
+
+				ctx.spawn("pov-requester-abomination", background.boxed())?;
 			},
 			_ => {},
 		}

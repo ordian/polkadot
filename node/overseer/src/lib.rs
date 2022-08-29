@@ -521,6 +521,8 @@ pub struct Overseer<SupportsParachains> {
 	#[subsystem(blocking, AvailabilityStoreMessage, sends: [
 		ChainApiMessage,
 		RuntimeApiMessage,
+		AvailabilityRecoveryMessage,
+		AvailabilityStoreMessage,
 	])]
 	availability_store: AvailabilityStore,
 

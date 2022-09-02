@@ -522,7 +522,6 @@ pub struct Overseer<SupportsParachains> {
 		ChainApiMessage,
 		RuntimeApiMessage,
 		AvailabilityRecoveryMessage,
-		AvailabilityStoreMessage,
 	])]
 	availability_store: AvailabilityStore,
 

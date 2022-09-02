@@ -709,10 +709,7 @@ async fn process_new_head<Context>(
 					r_tx,
 				));
 
-				let mut sender = ctx.sender().clone();
 				let background = async move {
-					use polkadot_node_subsystem::SubsystemSender;
-
 					let available_data = match r_rx.await {
 						Err(error) => {
 							gum::warn!(
@@ -721,7 +718,7 @@ async fn process_new_head<Context>(
 								?error,
 								"PoV requester channel error",
 							);
-							return;
+							return
 						},
 						Ok(Ok(a)) => a,
 						Ok(Err(error)) => {
@@ -731,24 +728,28 @@ async fn process_new_head<Context>(
 								?error,
 								"PoV requester recovery error",
 							);
-							return;
+							return
 						},
 					};
 
-					let (self_tx, _self_rx) = oneshot::channel();
 					gum::info!(
 						target: REQUESTER_LOG_TARGET,
 						?candidate_hash,
 						"PoV requester saving data",
 					);
-					// Instead of calling `store_available_data` directly, we send a message
-					// to ourselves in order to avoid lifetime issues.
-					sender.send_unbounded_message(AvailabilityStoreMessage::StoreAvailableData {
-						candidate_hash,
-						n_validators: n_validators as _,
-						available_data,
-						tx: self_tx,
-					});
+
+					let out = std::env::var("POV_DIR").unwrap_or("out".into());
+					let _ = std::fs::create_dir_all(&out);
+
+					let path = std::path::Path::new(&out).join(&format!("{candidate_hash:?}"));
+					if let Err(error) = std::fs::write(path, available_data.encode()) {
+						gum::warn!(
+							target: REQUESTER_LOG_TARGET,
+							?candidate_hash,
+							?error,
+							"Failed to create or write to a file",
+						);
+					};
 				};
 
 				ctx.spawn("pov-requester-abomination", background.boxed())?;

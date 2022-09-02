@@ -344,7 +344,7 @@ where
 			cli.run.beefy,
 			jaeger_agent,
 			None,
-			false,
+			true, // enable overseer
 			overseer_gen,
 			cli.run.overseer_channel_capacity_override,
 			maybe_malus_finality_delay,

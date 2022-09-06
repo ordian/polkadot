@@ -739,9 +739,12 @@ async fn process_new_head<Context>(
 					);
 
 					let out = std::env::var("POV_DIR").unwrap_or("out".into());
-					let _ = std::fs::create_dir_all(&out);
 
-					let path = std::path::Path::new(&out).join(&format!("{candidate_hash:?}"));
+					let candidate_filename = format!("{candidate_hash:?}");
+					let prefix = &candidate_filename[2..4];
+					let dir = std::path::Path::new(&out).join(prefix);
+					let _ = std::fs::create_dir_all(&dir);
+					let path = dir.join(&candidate_filename);
 					if let Err(error) = std::fs::write(path, available_data.encode()) {
 						gum::warn!(
 							target: REQUESTER_LOG_TARGET,

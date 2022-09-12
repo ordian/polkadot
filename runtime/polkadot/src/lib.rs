@@ -112,13 +112,13 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: create_runtime_str!("polkadot"),
 	impl_name: create_runtime_str!("parity-polkadot"),
 	authoring_version: 0,
-	spec_version: 9280,
+	spec_version: 9290,
 	impl_version: 0,
 	#[cfg(not(feature = "disable-runtime-api"))]
 	apis: RUNTIME_API_VERSIONS,
 	#[cfg(feature = "disable-runtime-api")]
 	apis: sp_version::create_apis_vec![[]],
-	transaction_version: 13,
+	transaction_version: 14,
 	state_version: 0,
 };
 
@@ -1574,7 +1574,7 @@ pub type Executive = frame_executive::Executive<
 	frame_system::ChainContext<Runtime>,
 	Runtime,
 	AllPalletsWithSystem,
-	InitiateNominationPools,
+	(InitiateNominationPools, pallet_nomination_pools::migration::v3::MigrateToV3<Runtime>),
 >;
 /// The payload being signed in transactions.
 pub type SignedPayload = generic::SignedPayload<Call, SignedExtra>;
@@ -1895,19 +1895,15 @@ sp_api::impl_runtime_apis! {
 	}
 
 	impl babe_primitives::BabeApi<Block> for Runtime {
-		fn configuration() -> babe_primitives::BabeGenesisConfiguration {
-			// The choice of `c` parameter (where `1 - c` represents the
-			// probability of a slot being empty), is done in accordance to the
-			// slot duration and expected target block time, for safely
-			// resisting network delays of maximum two seconds.
-			// <https://research.web3.foundation/en/latest/polkadot/BABE/Babe/#6-practical-results>
-			babe_primitives::BabeGenesisConfiguration {
+		fn configuration() -> babe_primitives::BabeConfiguration {
+			let epoch_config = Babe::epoch_config().unwrap_or(BABE_GENESIS_EPOCH_CONFIG);
+			babe_primitives::BabeConfiguration {
 				slot_duration: Babe::slot_duration(),
 				epoch_length: EpochDuration::get(),
-				c: BABE_GENESIS_EPOCH_CONFIG.c,
-				genesis_authorities: Babe::authorities().to_vec(),
+				c: epoch_config.c,
+				authorities: Babe::authorities().to_vec(),
 				randomness: Babe::randomness(),
-				allowed_slots: BABE_GENESIS_EPOCH_CONFIG.allowed_slots,
+				allowed_slots: epoch_config.allowed_slots,
 			}
 		}
 
@@ -2207,7 +2203,7 @@ mod test_fees {
 			)
 		};
 
-		while weight_with(voters) <= BlockWeights::get().max_block {
+		while weight_with(voters).all_lte(BlockWeights::get().max_block) {
 			voters += 1;
 		}
 
@@ -2241,7 +2237,9 @@ mod test_fees {
 		};
 
 		let mut active = target_voters;
-		while weight_with(active) <= OffchainSolutionWeightLimit::get() || active == target_voters {
+		while weight_with(active).all_lte(OffchainSolutionWeightLimit::get()) ||
+			active == target_voters
+		{
 			active += 1;
 		}
 

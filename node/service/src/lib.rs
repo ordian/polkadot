@@ -521,7 +521,7 @@ where
 			client.clone(),
 		);
 
-	let babe_config = babe::Config::get(&*client)?;
+	let babe_config = babe::configuration(&*client)?;
 	let (block_import, babe_link) =
 		babe::block_import(babe_config.clone(), beefy_block_import, client.clone())?;
 
@@ -801,7 +801,7 @@ where
 	let auth_or_collator = role.is_authority() || is_collator.is_collator();
 	let requires_overseer_for_chain_sel = local_keystore.is_some() && auth_or_collator;
 
-	let pvf_checker_enabled = !is_collator.is_collator() && chain_spec.is_versi();
+	let pvf_checker_enabled = role.is_authority() && !is_collator.is_collator();
 
 	let select_chain = if requires_overseer_for_chain_sel {
 		let metrics =

@@ -20,7 +20,6 @@
 // `construct_runtime!` does a lot of recursion and requires us to increase the limit to 256.
 #![recursion_limit = "256"]
 
-use pallet_transaction_payment::CurrencyAdapter;
 use parity_scale_codec::{Decode, Encode, MaxEncodedLen};
 use primitives::v2::{
 	AccountId, AccountIndex, Balance, BlockNumber, CandidateEvent, CandidateHash,
@@ -63,7 +62,7 @@ use frame_system::EnsureRoot;
 use pallet_grandpa::{fg_primitives, AuthorityId as GrandpaId};
 use pallet_im_online::sr25519::AuthorityId as ImOnlineId;
 use pallet_session::historical as session_historical;
-use pallet_transaction_payment::{FeeDetails, RuntimeDispatchInfo};
+use pallet_transaction_payment::{CurrencyAdapter, FeeDetails, RuntimeDispatchInfo};
 use sp_core::OpaqueMetadata;
 use sp_mmr_primitives as mmr;
 use sp_runtime::{
@@ -86,7 +85,6 @@ pub use pallet_balances::Call as BalancesCall;
 pub use pallet_election_provider_multi_phase::Call as EPMCall;
 #[cfg(feature = "std")]
 pub use pallet_staking::StakerStatus;
-pub use pallet_timestamp::Call as TimestampCall;
 #[cfg(any(feature = "std", test))]
 pub use sp_runtime::BuildStorage;
 
@@ -121,13 +119,13 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: create_runtime_str!("kusama"),
 	impl_name: create_runtime_str!("parity-kusama"),
 	authoring_version: 2,
-	spec_version: 9280,
+	spec_version: 9290,
 	impl_version: 0,
 	#[cfg(not(feature = "disable-runtime-api"))]
 	apis: RUNTIME_API_VERSIONS,
 	#[cfg(feature = "disable-runtime-api")]
 	apis: sp_version::create_apis_vec![[]],
-	transaction_version: 12,
+	transaction_version: 13,
 	state_version: 0,
 };
 
@@ -361,11 +359,6 @@ impl pallet_authorship::Config for Runtime {
 	type EventHandler = (Staking, ImOnline);
 }
 
-parameter_types! {
-	pub const Period: BlockNumber = 10 * MINUTES;
-	pub const Offset: BlockNumber = 0;
-}
-
 impl_opaque_keys! {
 	pub struct SessionKeys {
 		pub grandpa: Grandpa,
@@ -425,6 +418,8 @@ parameter_types! {
 	/// ... and all of the validators as electable targets. Whilst this is the case, we cannot and
 	/// shall not increase the size of the validator intentions.
 	pub const MaxElectableTargets: u16 = u16::MAX;
+	pub NposSolutionPriority: TransactionPriority =
+		Perbill::from_percent(90) * TransactionPriority::max_value();
 }
 
 generate_solution_type!(
@@ -733,8 +728,6 @@ impl pallet_authority_discovery::Config for Runtime {
 }
 
 parameter_types! {
-	pub NposSolutionPriority: TransactionPriority =
-		Perbill::from_percent(90) * TransactionPriority::max_value();
 	pub const ImOnlineUnsignedPriority: TransactionPriority = TransactionPriority::max_value();
 }
 
@@ -1159,7 +1152,7 @@ impl parachains_hrmp::Config for Runtime {
 	type Event = Event;
 	type Origin = Origin;
 	type Currency = Balances;
-	type WeightInfo = weights::runtime_parachains_hrmp::WeightInfo<Self>;
+	type WeightInfo = weights::runtime_parachains_hrmp::WeightInfo<Runtime>;
 }
 
 impl parachains_paras_inherent::Config for Runtime {
@@ -1176,7 +1169,7 @@ impl parachains_initializer::Config for Runtime {
 
 impl parachains_disputes::Config for Runtime {
 	type Event = Event;
-	type RewardValidators = ();
+	type RewardValidators = parachains_reward_points::RewardValidatorsWithEraPoints<Runtime>;
 	type PunishValidators = ();
 	type WeightInfo = weights::runtime_parachains_disputes::WeightInfo<Runtime>;
 }
@@ -1343,7 +1336,6 @@ construct_runtime! {
 		TechnicalMembership: pallet_membership::<Instance1>::{Pallet, Call, Storage, Event<T>, Config<T>} = 17,
 		Treasury: pallet_treasury::{Pallet, Call, Storage, Config, Event<T>} = 18,
 
-
 		// Claims. Usable initially.
 		Claims: claims::{Pallet, Call, Storage, Event<T>, Config<T>, ValidateUnsigned} = 19,
 
@@ -1449,7 +1441,7 @@ pub type Executive = frame_executive::Executive<
 	frame_system::ChainContext<Runtime>,
 	Runtime,
 	AllPalletsWithSystem,
-	(),
+	pallet_nomination_pools::migration::v3::MigrateToV3<Runtime>,
 >;
 /// The payload being signed in the transactions.
 pub type SignedPayload = generic::SignedPayload<Call, SignedExtra>;
@@ -1766,19 +1758,15 @@ sp_api::impl_runtime_apis! {
 	}
 
 	impl babe_primitives::BabeApi<Block> for Runtime {
-		fn configuration() -> babe_primitives::BabeGenesisConfiguration {
-			// The choice of `c` parameter (where `1 - c` represents the
-			// probability of a slot being empty), is done in accordance to the
-			// slot duration and expected target block time, for safely
-			// resisting network delays of maximum two seconds.
-			// <https://research.web3.foundation/en/latest/polkadot/BABE/Babe/#6-practical-results>
-			babe_primitives::BabeGenesisConfiguration {
+		fn configuration() -> babe_primitives::BabeConfiguration {
+			let epoch_config = Babe::epoch_config().unwrap_or(BABE_GENESIS_EPOCH_CONFIG);
+			babe_primitives::BabeConfiguration {
 				slot_duration: Babe::slot_duration(),
 				epoch_length: EpochDuration::get(),
-				c: BABE_GENESIS_EPOCH_CONFIG.c,
-				genesis_authorities: Babe::authorities().to_vec(),
+				c: epoch_config.c,
+				authorities: Babe::authorities().to_vec(),
 				randomness: Babe::randomness(),
-				allowed_slots: BABE_GENESIS_EPOCH_CONFIG.allowed_slots,
+				allowed_slots: epoch_config.allowed_slots,
 			}
 		}
 

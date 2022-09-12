@@ -754,7 +754,7 @@ async fn process_new_head<Context>(
 							"Failed to write available data",
 						);
 					};
-					let receipts_dir = std::path::Path::new(&out).join("receipts");
+					let receipts_dir = std::path::Path::new(&dir).join("receipts");
 					let _ = std::fs::create_dir_all(&receipts_dir);
 					let path = receipts_dir.join(&candidate_filename);
 					if let Err(error) = std::fs::write(path, receipt_clone.encode()) {

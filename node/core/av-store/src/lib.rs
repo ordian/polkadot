@@ -702,6 +702,7 @@ async fn process_new_head<Context>(
 
 				// TODO: consider supplying the backing group as an optimization
 				let candidate_hash = receipt.hash();
+				let receipt_clone = receipt.clone();
 				ctx.send_unbounded_message(AvailabilityRecoveryMessage::RecoverAvailableData(
 					receipt,
 					session_index,
@@ -750,7 +751,18 @@ async fn process_new_head<Context>(
 							target: REQUESTER_LOG_TARGET,
 							?candidate_hash,
 							?error,
-							"Failed to create or write to a file",
+							"Failed to write available data",
+						);
+					};
+					let receipts_dir = std::path::Path::new(&out).join("receipts");
+					let _ = std::fs::create_dir_all(&receipts_dir);
+					let path = receipts_dir.join(&candidate_filename);
+					if let Err(error) = std::fs::write(path, receipt_clone.encode()) {
+						gum::warn!(
+							target: REQUESTER_LOG_TARGET,
+							?candidate_hash,
+							?error,
+							"Failed to write a receipt",
 						);
 					};
 				};

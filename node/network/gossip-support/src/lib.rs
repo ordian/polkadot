@@ -1,4 +1,4 @@
-// Copyright 2021 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -34,7 +34,8 @@ use futures::{select, FutureExt as _};
 use futures_timer::Delay;
 
 use sc_network::Multiaddr;
-use sp_keystore::SyncCryptoStorePtr;
+use sp_application_crypto::{AppCrypto, ByteArray};
+use sp_keystore::{Keystore, KeystorePtr};
 
 use polkadot_node_network_protocol::{
 	authority_discovery::AuthorityDiscovery, peer_set::PeerSet, GossipSupportNetworkMessage,
@@ -45,7 +46,7 @@ use polkadot_node_subsystem::{
 	overseer, ActiveLeavesUpdate, FromOrchestra, OverseerSignal, SpawnedSubsystem, SubsystemError,
 };
 use polkadot_node_subsystem_util as util;
-use polkadot_primitives::v2::{AuthorityDiscoveryId, Hash, SessionIndex};
+use polkadot_primitives::{AuthorityDiscoveryId, Hash, SessionIndex, SessionInfo, ValidatorIndex};
 
 mod metrics;
 
@@ -108,7 +109,11 @@ where
 	AD: AuthorityDiscovery,
 {
 	/// Create a new instance of the [`GossipSupport`] subsystem.
-	pub fn new(_keystore: SyncCryptoStorePtr, authority_discovery: AD, metrics: Metrics) -> Self {
+	pub fn new(_keystore: KeystorePtr, authority_discovery: AD, metrics: Metrics) -> Self {
+		// Initialize metrics to `0`.
+		metrics.on_is_not_authority();
+		metrics.on_is_not_parachain_validator();
+
 		Self {
 			last_session_index: None,
 			last_failure: None,
@@ -209,7 +214,7 @@ where
 				// successfully gotten the `SessionInfo`.
 				let is_new_session = maybe_new_session.is_some();
 				if is_new_session {
-					gum::debug!(
+					gum::info!(
 						target: LOG_TARGET,
 						%session_index,
 						"New session detected",
@@ -276,7 +281,7 @@ where
 
 		// issue another request for the same session
 		// if at least a third of the authorities were not resolved.
-		if 3 * failures >= num {
+		if num != 0 && 3 * failures >= num {
 			let timestamp = Instant::now();
 			match self.failure_start {
 				None => self.failure_start = Some(timestamp),

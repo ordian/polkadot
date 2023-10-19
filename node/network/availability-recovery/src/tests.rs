@@ -1,4 +1,4 @@
-// Copyright 2020 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -36,7 +36,9 @@ use polkadot_node_subsystem::{
 };
 use polkadot_node_subsystem_test_helpers::{make_subsystem_context, TestSubsystemContextHandle};
 use polkadot_node_subsystem_util::TimeoutExt;
-use polkadot_primitives::v2::{AuthorityDiscoveryId, Hash, HeadData, PersistedValidationData};
+use polkadot_primitives::{
+	AuthorityDiscoveryId, Hash, HeadData, IndexedVec, PersistedValidationData, ValidatorId,
+};
 use polkadot_primitives_test_helpers::{dummy_candidate_receipt, dummy_hash};
 
 type VirtualOverseer = TestSubsystemContextHandle<AvailabilityRecoveryMessage>;
@@ -94,6 +96,44 @@ fn test_harness_chunks_only<T: Future<Output = (VirtualOverseer, RequestResponse
 	let (collation_req_receiver, req_cfg) =
 		IncomingRequest::get_config_receiver(&ReqProtocolNames::new(&GENESIS_HASH, None));
 	let subsystem = AvailabilityRecoverySubsystem::with_chunks_only(
+		collation_req_receiver,
+		Metrics::new_dummy(),
+	);
+	let subsystem = subsystem.run(context);
+
+	let test_fut = test(virtual_overseer, req_cfg);
+
+	futures::pin_mut!(test_fut);
+	futures::pin_mut!(subsystem);
+
+	executor::block_on(future::join(
+		async move {
+			let (mut overseer, _req_cfg) = test_fut.await;
+			overseer_signal(&mut overseer, OverseerSignal::Conclude).await;
+		},
+		subsystem,
+	))
+	.1
+	.unwrap();
+}
+
+fn test_harness_chunks_if_pov_large<
+	T: Future<Output = (VirtualOverseer, RequestResponseConfig)>,
+>(
+	test: impl FnOnce(VirtualOverseer, RequestResponseConfig) -> T,
+) {
+	let _ = env_logger::builder()
+		.is_test(true)
+		.filter(Some("polkadot_availability_recovery"), log::LevelFilter::Trace)
+		.try_init();
+
+	let pool = sp_core::testing::TaskExecutor::new();
+
+	let (context, virtual_overseer) = make_subsystem_context(pool.clone());
+
+	let (collation_req_receiver, req_cfg) =
+		IncomingRequest::get_config_receiver(&ReqProtocolNames::new(&GENESIS_HASH, None));
+	let subsystem = AvailabilityRecoverySubsystem::with_chunks_if_pov_large(
 		collation_req_receiver,
 		Metrics::new_dummy(),
 	);
@@ -179,7 +219,7 @@ impl Has {
 #[derive(Clone)]
 struct TestState {
 	validators: Vec<Sr25519Keyring>,
-	validator_public: Vec<ValidatorId>,
+	validator_public: IndexedVec<ValidatorIndex, ValidatorId>,
 	validator_authority_id: Vec<AuthorityDiscoveryId>,
 	current: Hash,
 	candidate: CandidateReceipt,
@@ -189,6 +229,7 @@ struct TestState {
 
 	available_data: AvailableData,
 	chunks: Vec<ErasureChunk>,
+	invalid_chunks: Vec<ErasureChunk>,
 }
 
 impl TestState {
@@ -217,7 +258,7 @@ impl TestState {
 					validators: self.validator_public.clone(),
 					discovery_keys: self.validator_authority_id.clone(),
 					// all validators in the same group.
-					validator_groups: vec![(0..self.validators.len()).map(|i| ValidatorIndex(i as _)).collect()],
+					validator_groups: IndexedVec::<GroupIndex,Vec<ValidatorIndex>>::from(vec![(0..self.validators.len()).map(|i| ValidatorIndex(i as _)).collect()]),
 					assignment_keys: vec![],
 					n_cores: 0,
 					zeroth_delay_tranche_width: 0,
@@ -246,7 +287,7 @@ impl TestState {
 				let _ = tx.send(if with_data {
 					Some(self.available_data.clone())
 				} else {
-					println!("SENDING NONE");
+					gum::debug!("Sending None");
 					None
 				});
 			}
@@ -273,6 +314,26 @@ impl TestState {
 		)
 	}
 
+	async fn respond_to_query_all_request_invalid(
+		&self,
+		virtual_overseer: &mut VirtualOverseer,
+		send_chunk: impl Fn(usize) -> bool,
+	) {
+		assert_matches!(
+			overseer_recv(virtual_overseer).await,
+			AllMessages::AvailabilityStore(
+				AvailabilityStoreMessage::QueryAllChunks(_, tx)
+			) => {
+				let v = self.invalid_chunks.iter()
+					.filter(|c| send_chunk(c.index.0 as usize))
+					.cloned()
+					.collect();
+
+				let _ = tx.send(v);
+			}
+		)
+	}
+
 	async fn test_chunk_requests(
 		&self,
 		candidate_hash: CandidateHash,
@@ -290,7 +351,7 @@ impl TestState {
 				AllMessages::NetworkBridgeTx(
 					NetworkBridgeTxMessage::SendRequests(
 						requests,
-						IfDisconnected::ImmediateError,
+						_if_disconnected,
 					)
 				) => {
 					for req in requests {
@@ -381,7 +442,7 @@ impl TestState {
 	}
 }
 
-fn validator_pubkeys(val_ids: &[Sr25519Keyring]) -> Vec<ValidatorId> {
+fn validator_pubkeys(val_ids: &[Sr25519Keyring]) -> IndexedVec<ValidatorIndex, ValidatorId> {
 	val_ids.iter().map(|v| v.public().into()).collect()
 }
 
@@ -454,6 +515,22 @@ impl Default for TestState {
 			&available_data,
 			|_, _| {},
 		);
+		// Mess around:
+		let invalid_chunks = chunks
+			.iter()
+			.cloned()
+			.map(|mut chunk| {
+				if chunk.chunk.len() >= 2 && chunk.chunk[0] != chunk.chunk[1] {
+					chunk.chunk[0] = chunk.chunk[1];
+				} else if chunk.chunk.len() >= 1 {
+					chunk.chunk[0] = !chunk.chunk[0];
+				} else {
+					chunk.proof = Proof::dummy_proof();
+				}
+				chunk
+			})
+			.collect();
+		debug_assert_ne!(chunks, invalid_chunks);
 
 		candidate.descriptor.erasure_root = erasure_root;
 		candidate.descriptor.relay_parent = Hash::repeat_byte(10);
@@ -468,6 +545,7 @@ impl Default for TestState {
 			persisted_validation_data,
 			available_data,
 			chunks,
+			invalid_chunks,
 		}
 	}
 }
@@ -861,6 +939,169 @@ fn fast_path_backing_group_recovers() {
 			3 => Has::Yes,
 			_ => Has::No,
 		};
+
+		test_state.respond_to_available_data_query(&mut virtual_overseer, false).await;
+
+		test_state
+			.test_full_data_requests(candidate_hash, &mut virtual_overseer, who_has)
+			.await;
+
+		// Recovered data should match the original one.
+		assert_eq!(rx.await.unwrap().unwrap(), test_state.available_data);
+		(virtual_overseer, req_cfg)
+	});
+}
+
+#[test]
+fn recovers_from_only_chunks_if_pov_large() {
+	let test_state = TestState::default();
+
+	test_harness_chunks_if_pov_large(|mut virtual_overseer, req_cfg| async move {
+		overseer_signal(
+			&mut virtual_overseer,
+			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate::start_work(ActivatedLeaf {
+				hash: test_state.current.clone(),
+				number: 1,
+				status: LeafStatus::Fresh,
+				span: Arc::new(jaeger::Span::Disabled),
+			})),
+		)
+		.await;
+
+		let (tx, rx) = oneshot::channel();
+
+		overseer_send(
+			&mut virtual_overseer,
+			AvailabilityRecoveryMessage::RecoverAvailableData(
+				test_state.candidate.clone(),
+				test_state.session_index,
+				Some(GroupIndex(0)),
+				tx,
+			),
+		)
+		.await;
+
+		test_state.test_runtime_api(&mut virtual_overseer).await;
+
+		let candidate_hash = test_state.candidate.hash();
+
+		assert_matches!(
+			overseer_recv(&mut virtual_overseer).await,
+			AllMessages::AvailabilityStore(
+				AvailabilityStoreMessage::QueryChunkSize(_, tx)
+			) => {
+				let _ = tx.send(Some(1000000));
+			}
+		);
+
+		test_state.respond_to_available_data_query(&mut virtual_overseer, false).await;
+		test_state.respond_to_query_all_request(&mut virtual_overseer, |_| false).await;
+
+		test_state
+			.test_chunk_requests(
+				candidate_hash,
+				&mut virtual_overseer,
+				test_state.threshold(),
+				|_| Has::Yes,
+			)
+			.await;
+
+		// Recovered data should match the original one.
+		assert_eq!(rx.await.unwrap().unwrap(), test_state.available_data);
+
+		let (tx, rx) = oneshot::channel();
+
+		// Test another candidate, send no chunks.
+		let mut new_candidate = dummy_candidate_receipt(dummy_hash());
+
+		new_candidate.descriptor.relay_parent = test_state.candidate.descriptor.relay_parent;
+
+		overseer_send(
+			&mut virtual_overseer,
+			AvailabilityRecoveryMessage::RecoverAvailableData(
+				new_candidate.clone(),
+				test_state.session_index,
+				None,
+				tx,
+			),
+		)
+		.await;
+
+		test_state.test_runtime_api(&mut virtual_overseer).await;
+
+		assert_matches!(
+			overseer_recv(&mut virtual_overseer).await,
+			AllMessages::AvailabilityStore(
+				AvailabilityStoreMessage::QueryChunkSize(_, tx)
+			) => {
+				let _ = tx.send(Some(1000000));
+			}
+		);
+
+		test_state.respond_to_available_data_query(&mut virtual_overseer, false).await;
+		test_state.respond_to_query_all_request(&mut virtual_overseer, |_| false).await;
+
+		test_state
+			.test_chunk_requests(
+				new_candidate.hash(),
+				&mut virtual_overseer,
+				test_state.impossibility_threshold(),
+				|_| Has::No,
+			)
+			.await;
+
+		// A request times out with `Unavailable` error.
+		assert_eq!(rx.await.unwrap().unwrap_err(), RecoveryError::Unavailable);
+		(virtual_overseer, req_cfg)
+	});
+}
+
+#[test]
+fn fast_path_backing_group_recovers_if_pov_small() {
+	let test_state = TestState::default();
+
+	test_harness_chunks_if_pov_large(|mut virtual_overseer, req_cfg| async move {
+		overseer_signal(
+			&mut virtual_overseer,
+			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate::start_work(ActivatedLeaf {
+				hash: test_state.current.clone(),
+				number: 1,
+				status: LeafStatus::Fresh,
+				span: Arc::new(jaeger::Span::Disabled),
+			})),
+		)
+		.await;
+
+		let (tx, rx) = oneshot::channel();
+
+		overseer_send(
+			&mut virtual_overseer,
+			AvailabilityRecoveryMessage::RecoverAvailableData(
+				test_state.candidate.clone(),
+				test_state.session_index,
+				Some(GroupIndex(0)),
+				tx,
+			),
+		)
+		.await;
+
+		test_state.test_runtime_api(&mut virtual_overseer).await;
+
+		let candidate_hash = test_state.candidate.hash();
+
+		let who_has = |i| match i {
+			3 => Has::Yes,
+			_ => Has::No,
+		};
+
+		assert_matches!(
+			overseer_recv(&mut virtual_overseer).await,
+			AllMessages::AvailabilityStore(
+				AvailabilityStoreMessage::QueryChunkSize(_, tx)
+			) => {
+				let _ = tx.send(Some(100));
+			}
+		);
 
 		test_state.respond_to_available_data_query(&mut virtual_overseer, false).await;
 
@@ -1270,6 +1511,57 @@ fn does_not_query_local_validator() {
 			.await;
 
 		// second round, make sure it uses the local chunk.
+		test_state
+			.test_chunk_requests(
+				candidate_hash,
+				&mut virtual_overseer,
+				test_state.threshold() - 1,
+				|i| if i == 0 { panic!("requested from local validator") } else { Has::Yes },
+			)
+			.await;
+
+		assert_eq!(rx.await.unwrap().unwrap(), test_state.available_data);
+		(virtual_overseer, req_cfg)
+	});
+}
+
+#[test]
+fn invalid_local_chunk_is_ignored() {
+	let test_state = TestState::default();
+
+	test_harness_chunks_only(|mut virtual_overseer, req_cfg| async move {
+		overseer_signal(
+			&mut virtual_overseer,
+			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate::start_work(ActivatedLeaf {
+				hash: test_state.current.clone(),
+				number: 1,
+				status: LeafStatus::Fresh,
+				span: Arc::new(jaeger::Span::Disabled),
+			})),
+		)
+		.await;
+
+		let (tx, rx) = oneshot::channel();
+
+		overseer_send(
+			&mut virtual_overseer,
+			AvailabilityRecoveryMessage::RecoverAvailableData(
+				test_state.candidate.clone(),
+				test_state.session_index,
+				None,
+				tx,
+			),
+		)
+		.await;
+
+		test_state.test_runtime_api(&mut virtual_overseer).await;
+		test_state.respond_to_available_data_query(&mut virtual_overseer, false).await;
+		test_state
+			.respond_to_query_all_request_invalid(&mut virtual_overseer, |i| i == 0)
+			.await;
+
+		let candidate_hash = test_state.candidate.hash();
+
 		test_state
 			.test_chunk_requests(
 				candidate_hash,

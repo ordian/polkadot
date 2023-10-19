@@ -1,4 +1,4 @@
-// Copyright 2020 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -36,7 +36,7 @@ async fn purge_chain_rocksdb_works() {
 	let mut cmd = Command::new(cargo_bin("polkadot"))
 		.stdout(process::Stdio::piped())
 		.stderr(process::Stdio::piped())
-		.args(&["--dev", "-d"])
+		.args(["--dev", "-d"])
 		.arg(tmpdir.path())
 		.arg("--port")
 		.arg("33034")
@@ -61,7 +61,7 @@ async fn purge_chain_rocksdb_works() {
 
 	// Purge chain
 	let status = Command::new(cargo_bin("polkadot"))
-		.args(&["purge-chain", "--dev", "-d"])
+		.args(["purge-chain", "--dev", "-d"])
 		.arg(tmpdir.path())
 		.arg("-y")
 		.status()
@@ -86,7 +86,7 @@ async fn purge_chain_paritydb_works() {
 	let mut cmd = Command::new(cargo_bin("polkadot"))
 		.stdout(process::Stdio::piped())
 		.stderr(process::Stdio::piped())
-		.args(&["--dev", "-d"])
+		.args(["--dev", "-d"])
 		.arg(tmpdir.path())
 		.arg("--database")
 		.arg("paritydb-experimental")
@@ -111,7 +111,7 @@ async fn purge_chain_paritydb_works() {
 
 	// Purge chain
 	let status = Command::new(cargo_bin("polkadot"))
-		.args(&["purge-chain", "--dev", "-d"])
+		.args(["purge-chain", "--dev", "-d"])
 		.arg(tmpdir.path())
 		.arg("--database")
 		.arg("paritydb-experimental")

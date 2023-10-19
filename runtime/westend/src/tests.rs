@@ -1,4 +1,4 @@
-// Copyright 2021 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -17,7 +17,7 @@
 //! Tests for the Westend Runtime Configuration
 
 use crate::*;
-use xcm::latest::{AssetId::*, Fungibility::*, MultiLocation};
+use xcm::latest::prelude::*;
 
 #[test]
 fn remove_keys_weight_is_sensible() {
@@ -43,10 +43,18 @@ fn sample_size_is_sensible() {
 #[test]
 fn call_size() {
 	assert!(
-		core::mem::size_of::<Call>() <= 230,
-		"size of Call is more than 230 bytes: some calls have too big arguments, use Box to reduce \
-		the size of Call.
+		core::mem::size_of::<RuntimeCall>() <= 230,
+		"size of RuntimeCall is more than 230 bytes: some calls have too big arguments, use Box to reduce \
+		the size of RuntimeCall.
 		If the limit is too strong, maybe consider increase the limit to 300.",
+	);
+}
+
+#[test]
+fn max_upward_message_size() {
+	assert_eq!(
+		ump_migrations::MAX_UPWARD_MESSAGE_SIZE,
+		pallet_message_queue::MaxMessageLenOf::<Runtime>::get()
 	);
 }
 
@@ -57,9 +65,9 @@ fn sanity_check_teleport_assets_weight() {
 	// so this test will certainly ensure that this problem does not occur.
 	use frame_support::dispatch::GetDispatchInfo;
 	let weight = pallet_xcm::Call::<Runtime>::teleport_assets {
-		dest: Box::new(xcm::VersionedMultiLocation::V1(MultiLocation::here())),
-		beneficiary: Box::new(xcm::VersionedMultiLocation::V1(MultiLocation::here())),
-		assets: Box::new((Concrete(MultiLocation::here()), Fungible(200_000)).into()),
+		dest: Box::new(Here.into()),
+		beneficiary: Box::new(Here.into()),
+		assets: Box::new((Here, 200_000).into()),
 		fee_asset_item: 0,
 	}
 	.get_dispatch_info()

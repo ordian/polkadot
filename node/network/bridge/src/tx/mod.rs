@@ -1,4 +1,4 @@
-// Copyright 2020 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -90,7 +90,7 @@ where
 		let future = run_network_out(self, ctx)
 			.map_err(|e| SubsystemError::with_origin("network-bridge", e))
 			.boxed();
-		SpawnedSubsystem { name: "network-bridge-subsystem", future }
+		SpawnedSubsystem { name: "network-bridge-tx-subsystem", future }
 	}
 }
 

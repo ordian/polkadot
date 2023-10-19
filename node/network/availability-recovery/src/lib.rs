@@ -1,4 +1,4 @@
-// Copyright 2020 Parity Technologies (UK) Ltd.
+// Copyright (C) Parity Technologies (UK) Ltd.
 // This file is part of Polkadot.
 
 // Polkadot is free software: you can redistribute it and/or modify
@@ -20,6 +20,7 @@
 
 use std::{
 	collections::{HashMap, VecDeque},
+	num::NonZeroUsize,
 	pin::Pin,
 	time::Duration,
 };
@@ -55,9 +56,9 @@ use polkadot_node_subsystem::{
 	SubsystemResult,
 };
 use polkadot_node_subsystem_util::request_session_info;
-use polkadot_primitives::v2::{
+use polkadot_primitives::{
 	AuthorityDiscoveryId, BlakeTwo256, BlockNumber, CandidateHash, CandidateReceipt, GroupIndex,
-	Hash, HashT, SessionIndex, SessionInfo, ValidatorId, ValidatorIndex,
+	Hash, HashT, IndexedVec, SessionIndex, SessionInfo, ValidatorId, ValidatorIndex,
 };
 
 mod error;
@@ -77,7 +78,10 @@ const LOG_TARGET: &str = "parachain::availability-recovery";
 const N_PARALLEL: usize = 50;
 
 // Size of the LRU cache where we keep recovered data.
-const LRU_SIZE: usize = 16;
+const LRU_SIZE: NonZeroUsize = match NonZeroUsize::new(16) {
+	Some(cap) => cap,
+	None => panic!("Availability-recovery cache size must be non-zero."),
+};
 
 const COST_INVALID_REQUEST: Rep = Rep::CostMajor("Peer sent unparsable request");
 
@@ -95,9 +99,47 @@ const TIMEOUT_START_NEW_REQUESTS: Duration = CHUNK_REQUEST_TIMEOUT;
 #[cfg(test)]
 const TIMEOUT_START_NEW_REQUESTS: Duration = Duration::from_millis(100);
 
+/// PoV size limit in bytes for which prefer fetching from backers.
+const SMALL_POV_LIMIT: usize = 128 * 1024;
+
+#[derive(Clone, PartialEq)]
+/// The strategy we use to recover the PoV.
+pub enum RecoveryStrategy {
+	/// We always try the backing group first, then fallback to validator chunks.
+	BackersFirstAlways,
+	/// We try the backing group first if PoV size is lower than specified, then fallback to validator chunks.
+	BackersFirstIfSizeLower(usize),
+	/// We always recover using validator chunks.
+	ChunksAlways,
+	/// Do not request data from the availability store.
+	/// This is the useful for nodes where the
+	/// availability-store subsystem is not expected to run,
+	/// such as collators.
+	BypassAvailabilityStore,
+}
+
+impl RecoveryStrategy {
+	/// Returns true if the strategy needs backing group index.
+	pub fn needs_backing_group(&self) -> bool {
+		match self {
+			RecoveryStrategy::BackersFirstAlways | RecoveryStrategy::BackersFirstIfSizeLower(_) =>
+				true,
+			_ => false,
+		}
+	}
+
+	/// Returns the PoV size limit in bytes for `BackersFirstIfSizeLower` strategy, otherwise `None`.
+	pub fn pov_size_limit(&self) -> Option<usize> {
+		match *self {
+			RecoveryStrategy::BackersFirstIfSizeLower(limit) => Some(limit),
+			_ => None,
+		}
+	}
+}
 /// The Availability Recovery Subsystem.
 pub struct AvailabilityRecoverySubsystem {
-	fast_path: bool,
+	/// PoV recovery strategy to use.
+	recovery_strategy: RecoveryStrategy,
 	/// Receiver for available data requests.
 	req_receiver: IncomingRequestReceiver<request_v1::AvailableDataFetchingRequest>,
 	/// Metrics for this subsystem.
@@ -130,7 +172,7 @@ struct RecoveryParams {
 	validator_authority_keys: Vec<AuthorityDiscoveryId>,
 
 	/// Validators relevant to this `RecoveryTask`.
-	validators: Vec<ValidatorId>,
+	validators: IndexedVec<ValidatorIndex, ValidatorId>,
 
 	/// The number of pieces needed.
 	threshold: usize,
@@ -143,6 +185,9 @@ struct RecoveryParams {
 
 	/// Metrics to report
 	metrics: Metrics,
+
+	/// Do not request data from availability-store
+	bypass_availability_store: bool,
 }
 
 /// Source the availability data either by means
@@ -334,8 +379,7 @@ impl RequestChunksFromValidators {
 					index: validator_index,
 				};
 
-				let (req, res) =
-					OutgoingRequest::new(Recipient::Authority(validator), raw_request.clone());
+				let (req, res) = OutgoingRequest::new(Recipient::Authority(validator), raw_request);
 				requests.push(Requests::ChunkFetchingV1(req));
 
 				params.metrics.on_chunk_request_issued();
@@ -358,7 +402,7 @@ impl RequestChunksFromValidators {
 		sender
 			.send_message(NetworkBridgeTxMessage::SendRequests(
 				requests,
-				IfDisconnected::ImmediateError,
+				IfDisconnected::TryConnect,
 			))
 			.await;
 	}
@@ -376,49 +420,20 @@ impl RequestChunksFromValidators {
 			self.total_received_responses += 1;
 
 			match request_result {
-				Ok(Some(chunk)) => {
-					// Check merkle proofs of any received chunks.
-
-					let validator_index = chunk.index;
-
-					if let Ok(anticipated_hash) =
-						branch_hash(&params.erasure_root, chunk.proof(), chunk.index.0 as usize)
-					{
-						let erasure_chunk_hash = BlakeTwo256::hash(&chunk.chunk);
-
-						if erasure_chunk_hash != anticipated_hash {
-							metrics.on_chunk_request_invalid();
-							self.error_count += 1;
-
-							gum::debug!(
-								target: LOG_TARGET,
-								candidate_hash = ?params.candidate_hash,
-								?validator_index,
-								"Merkle proof mismatch",
-							);
-						} else {
-							metrics.on_chunk_request_succeeded();
-
-							gum::trace!(
-								target: LOG_TARGET,
-								candidate_hash = ?params.candidate_hash,
-								?validator_index,
-								"Received valid chunk.",
-							);
-							self.received_chunks.insert(validator_index, chunk);
-						}
+				Ok(Some(chunk)) =>
+					if is_chunk_valid(params, &chunk) {
+						metrics.on_chunk_request_succeeded();
+						gum::trace!(
+							target: LOG_TARGET,
+							candidate_hash = ?params.candidate_hash,
+							validator_index = ?chunk.index,
+							"Received valid chunk",
+						);
+						self.received_chunks.insert(chunk.index, chunk);
 					} else {
 						metrics.on_chunk_request_invalid();
 						self.error_count += 1;
-
-						gum::debug!(
-							target: LOG_TARGET,
-							candidate_hash = ?params.candidate_hash,
-							?validator_index,
-							"Invalid Merkle proof",
-						);
-					}
-				},
+					},
 				Ok(None) => {
 					metrics.on_chunk_request_no_such_chunk();
 					self.error_count += 1;
@@ -493,7 +508,7 @@ impl RequestChunksFromValidators {
 		let metrics = &params.metrics;
 
 		// First query the store for any chunks we've got.
-		{
+		if !params.bypass_availability_store {
 			let (tx, rx) = oneshot::channel();
 			sender
 				.send_message(AvailabilityStoreMessage::QueryAllChunks(params.candidate_hash, tx))
@@ -507,7 +522,20 @@ impl RequestChunksFromValidators {
 					self.shuffling.retain(|i| !chunk_indices.contains(i));
 
 					for chunk in chunks {
-						self.received_chunks.insert(chunk.index, chunk);
+						if is_chunk_valid(params, &chunk) {
+							gum::trace!(
+								target: LOG_TARGET,
+								candidate_hash = ?params.candidate_hash,
+								validator_index = ?chunk.index,
+								"Found valid chunk on disk"
+							);
+							self.received_chunks.insert(chunk.index, chunk);
+						} else {
+							gum::error!(
+								target: LOG_TARGET,
+								"Loaded invalid chunk from disk! Disk/Db corruption _very_ likely - please fix ASAP!"
+							);
+						};
 					}
 				},
 				Err(oneshot::Canceled) => {
@@ -609,6 +637,35 @@ const fn is_unavailable(
 	received_chunks + requesting_chunks + unrequested_validators < threshold
 }
 
+/// Check validity of a chunk.
+fn is_chunk_valid(params: &RecoveryParams, chunk: &ErasureChunk) -> bool {
+	let anticipated_hash =
+		match branch_hash(&params.erasure_root, chunk.proof(), chunk.index.0 as usize) {
+			Ok(hash) => hash,
+			Err(e) => {
+				gum::debug!(
+					target: LOG_TARGET,
+					candidate_hash = ?params.candidate_hash,
+					validator_index = ?chunk.index,
+					error = ?e,
+					"Invalid Merkle proof",
+				);
+				return false
+			},
+		};
+	let erasure_chunk_hash = BlakeTwo256::hash(&chunk.chunk);
+	if anticipated_hash != erasure_chunk_hash {
+		gum::debug!(
+			target: LOG_TARGET,
+			candidate_hash = ?params.candidate_hash,
+			validator_index = ?chunk.index,
+			"Merkle proof mismatch"
+		);
+		return false
+	}
+	true
+}
+
 /// Re-encode the data into erasure chunks in order to verify
 /// the root hash of the provided Merkle tree, which is built
 /// on-top of the encoded chunks.
@@ -652,7 +709,7 @@ where
 {
 	async fn run(mut self) -> Result<AvailableData, RecoveryError> {
 		// First just see if we have the data available locally.
-		{
+		if !self.params.bypass_availability_store {
 			let (tx, rx) = oneshot::channel();
 			self.sender
 				.send_message(AvailabilityStoreMessage::QueryAvailableData(
@@ -819,7 +876,7 @@ async fn handle_signal(state: &mut State, signal: OverseerSignal) -> SubsystemRe
 		OverseerSignal::Conclude => Ok(true),
 		OverseerSignal::ActiveLeaves(ActiveLeavesUpdate { activated, .. }) => {
 			// if activated is non-empty, set state.live_block to the highest block in `activated`
-			for activated in activated {
+			if let Some(activated) = activated {
 				if activated.number > state.live_block.0 {
 					state.live_block = (activated.number, activated.hash)
 				}
@@ -838,9 +895,10 @@ async fn launch_recovery_task<Context>(
 	ctx: &mut Context,
 	session_info: SessionInfo,
 	receipt: CandidateReceipt,
-	backing_group: Option<GroupIndex>,
+	mut backing_group: Option<GroupIndex>,
 	response_sender: oneshot::Sender<Result<AvailableData, RecoveryError>>,
 	metrics: &Metrics,
+	recovery_strategy: &RecoveryStrategy,
 ) -> error::Result<()> {
 	let candidate_hash = receipt.hash();
 
@@ -851,10 +909,35 @@ async fn launch_recovery_task<Context>(
 		candidate_hash,
 		erasure_root: receipt.descriptor.erasure_root,
 		metrics: metrics.clone(),
+		bypass_availability_store: recovery_strategy == &RecoveryStrategy::BypassAvailabilityStore,
 	};
 
+	if let Some(small_pov_limit) = recovery_strategy.pov_size_limit() {
+		// Get our own chunk size to get an estimate of the PoV size.
+		let chunk_size: Result<Option<usize>, error::Error> =
+			query_chunk_size(ctx, candidate_hash).await;
+		if let Ok(Some(chunk_size)) = chunk_size {
+			let pov_size_estimate = chunk_size.saturating_mul(session_info.validators.len()) / 3;
+			let prefer_backing_group = pov_size_estimate < small_pov_limit;
+
+			gum::trace!(
+				target: LOG_TARGET,
+				?candidate_hash,
+				pov_size_estimate,
+				small_pov_limit,
+				enabled = prefer_backing_group,
+				"Prefer fetch from backing group",
+			);
+
+			backing_group = backing_group.filter(|_| {
+				// We keep the backing group only if `1/3` of chunks sum up to less than `small_pov_limit`.
+				prefer_backing_group
+			});
+		}
+	}
+
 	let phase = backing_group
-		.and_then(|g| session_info.validator_groups.get(g.0 as usize))
+		.and_then(|g| session_info.validator_groups.get(g))
 		.map(|group| Source::RequestFromBackers(RequestFromBackers::new(group.clone())))
 		.unwrap_or_else(|| {
 			Source::RequestChunks(RequestChunksFromValidators::new(params.validators.len() as _))
@@ -891,6 +974,7 @@ async fn handle_recover<Context>(
 	backing_group: Option<GroupIndex>,
 	response_sender: oneshot::Sender<Result<AvailableData, RecoveryError>>,
 	metrics: &Metrics,
+	recovery_strategy: &RecoveryStrategy,
 ) -> error::Result<()> {
 	let candidate_hash = receipt.hash();
 
@@ -934,6 +1018,7 @@ async fn handle_recover<Context>(
 				backing_group,
 				response_sender,
 				metrics,
+				recovery_strategy,
 			)
 			.await,
 		None => {
@@ -956,18 +1041,39 @@ async fn query_full_data<Context>(
 	ctx.send_message(AvailabilityStoreMessage::QueryAvailableData(candidate_hash, tx))
 		.await;
 
-	Ok(rx.await.map_err(error::Error::CanceledQueryFullData)?)
+	rx.await.map_err(error::Error::CanceledQueryFullData)
 }
 
+/// Queries a chunk from av-store.
+#[overseer::contextbounds(AvailabilityRecovery, prefix = self::overseer)]
+async fn query_chunk_size<Context>(
+	ctx: &mut Context,
+	candidate_hash: CandidateHash,
+) -> error::Result<Option<usize>> {
+	let (tx, rx) = oneshot::channel();
+	ctx.send_message(AvailabilityStoreMessage::QueryChunkSize(candidate_hash, tx))
+		.await;
+
+	rx.await.map_err(error::Error::CanceledQueryFullData)
+}
 #[overseer::contextbounds(AvailabilityRecovery, prefix = self::overseer)]
 impl AvailabilityRecoverySubsystem {
+	/// Create a new instance of `AvailabilityRecoverySubsystem` which never requests the  
+	/// `AvailabilityStoreSubsystem` subsystem.
+	pub fn with_availability_store_skip(
+		req_receiver: IncomingRequestReceiver<request_v1::AvailableDataFetchingRequest>,
+		metrics: Metrics,
+	) -> Self {
+		Self { recovery_strategy: RecoveryStrategy::BypassAvailabilityStore, req_receiver, metrics }
+	}
+
 	/// Create a new instance of `AvailabilityRecoverySubsystem` which starts with a fast path to
 	/// request data from backers.
 	pub fn with_fast_path(
 		req_receiver: IncomingRequestReceiver<request_v1::AvailableDataFetchingRequest>,
 		metrics: Metrics,
 	) -> Self {
-		Self { fast_path: true, req_receiver, metrics }
+		Self { recovery_strategy: RecoveryStrategy::BackersFirstAlways, req_receiver, metrics }
 	}
 
 	/// Create a new instance of `AvailabilityRecoverySubsystem` which requests only chunks
@@ -975,12 +1081,25 @@ impl AvailabilityRecoverySubsystem {
 		req_receiver: IncomingRequestReceiver<request_v1::AvailableDataFetchingRequest>,
 		metrics: Metrics,
 	) -> Self {
-		Self { fast_path: false, req_receiver, metrics }
+		Self { recovery_strategy: RecoveryStrategy::ChunksAlways, req_receiver, metrics }
+	}
+
+	/// Create a new instance of `AvailabilityRecoverySubsystem` which requests chunks if PoV is
+	/// above a threshold.
+	pub fn with_chunks_if_pov_large(
+		req_receiver: IncomingRequestReceiver<request_v1::AvailableDataFetchingRequest>,
+		metrics: Metrics,
+	) -> Self {
+		Self {
+			recovery_strategy: RecoveryStrategy::BackersFirstIfSizeLower(SMALL_POV_LIMIT),
+			req_receiver,
+			metrics,
+		}
 	}
 
 	async fn run<Context>(self, mut ctx: Context) -> SubsystemResult<()> {
 		let mut state = State::default();
-		let Self { fast_path, mut req_receiver, metrics } = self;
+		let Self { recovery_strategy, mut req_receiver, metrics } = self;
 
 		loop {
 			let recv_req = req_receiver.recv(|| vec![COST_INVALID_REQUEST]).fuse();
@@ -1007,9 +1126,10 @@ impl AvailabilityRecoverySubsystem {
 										&mut ctx,
 										receipt,
 										session_index,
-										maybe_backing_group.filter(|_| fast_path),
+										maybe_backing_group.filter(|_| recovery_strategy.needs_backing_group()),
 										response_sender,
 										&metrics,
+										&recovery_strategy,
 									).await {
 										gum::warn!(
 											target: LOG_TARGET,
@@ -1025,6 +1145,14 @@ impl AvailabilityRecoverySubsystem {
 				in_req = recv_req => {
 					match in_req.into_nested().map_err(|fatal| SubsystemError::with_origin("availability-recovery", fatal))? {
 						Ok(req) => {
+							if recovery_strategy == RecoveryStrategy::BypassAvailabilityStore {
+								gum::debug!(
+									target: LOG_TARGET,
+									"Skipping request to availability-store.",
+								);
+								let _ = req.send_response(None.into());
+								continue
+							}
 							match query_full_data(&mut ctx, req.payload.candidate_hash).await {
 								Ok(res) => {
 									let _ = req.send_response(res.into());

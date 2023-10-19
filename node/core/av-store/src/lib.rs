@@ -42,7 +42,14 @@ use polkadot_node_subsystem::{
 use polkadot_node_subsystem_util as util;
 use polkadot_primitives::{
 	BlockNumber, CandidateEvent, CandidateHash, CandidateReceipt, Hash, Header, ValidatorIndex,
+	CandidateDescriptor,
 };
+
+use parquet_derive::ParquetRecordWriter;
+use parquet::file::{writer::SerializedFileWriter, properties::WriterProperties};
+use parquet::record::RecordWriter as _;
+use cloud_storage::Client;
+use chrono::{DateTime, Utc, Datelike};
 
 mod metrics;
 pub use self::metrics::*;
@@ -673,6 +680,44 @@ async fn process_block_activated<Context>(
 	Ok(())
 }
 
+
+#[derive(ParquetRecordWriter, Debug)]
+struct ParquetPoVRecord {
+	pub para_id: u32,
+	pub pov_size_bytes: u32,
+	pub inclusion_block_number: u32,
+	pub inclusion_block_hash: String,
+	pub relay_parent: String,
+	pub candidate_hash: String,
+	pub pov_hash: String,
+	pub para_head: String,
+}
+
+fn hash_to_string(hash: &Hash) -> String {
+	format!("0x{hash:?}")
+}
+
+impl ParquetPoVRecord {
+	pub fn new(
+		cd: &CandidateDescriptor,
+		pov_size_bytes: usize,
+		inclusion_block_number: u32,
+		inclusion_hash: &Hash,
+		candidate_hash: &CandidateHash,
+	) -> Self {
+		Self {
+			para_id: u32::from(cd.para_id),
+			pov_size_bytes: pov_size_bytes as u32,
+			inclusion_block_number,
+			inclusion_block_hash: hash_to_string(inclusion_hash),
+			relay_parent: hash_to_string(&cd.relay_parent),
+			pov_hash: hash_to_string(&cd.pov_hash),
+			candidate_hash: hash_to_string(&candidate_hash.0),
+			para_head: hash_to_string(&cd.para_head),
+		}
+	}
+}
+
 #[overseer::contextbounds(AvailabilityStore, prefix = self::overseer)]
 async fn process_new_head<Context>(
 	ctx: &mut Context,
@@ -707,12 +752,13 @@ async fn process_new_head<Context>(
 				)?;
 			},
 			CandidateEvent::CandidateIncluded(receipt, _head, _core_index, _group_index) => {
+				let inclusion_block_number = header.number;
 				note_block_included(
 					db,
 					db_transaction,
 					config,
 					pruning_config,
-					(header.number, hash),
+					(inclusion_block_number, hash),
 					receipt.clone(),
 				)?;
 
@@ -764,12 +810,19 @@ async fn process_new_head<Context>(
 
 					let out = std::env::var("POV_DIR").unwrap_or("out".into());
 
+					let network = if out.ends_with("kusama/") {
+						"kusama"
+					} else {
+						"polkadot"
+					};
 					let candidate_filename = format!("{candidate_hash:?}");
 					let prefix = &candidate_filename[2..4];
 					let dir = std::path::Path::new(&out).join(prefix);
 					let _ = std::fs::create_dir_all(&dir);
 					let path = dir.join(&candidate_filename);
-					if let Err(error) = std::fs::write(path, available_data.encode()) {
+					let encoded_pov = available_data.encode();
+					let pov_size_bytes = encoded_pov.len();
+					if let Err(error) = std::fs::write(path, encoded_pov) {
 						gum::warn!(
 							target: REQUESTER_LOG_TARGET,
 							?candidate_hash,
@@ -788,6 +841,47 @@ async fn process_new_head<Context>(
 							"Failed to write a receipt",
 						);
 					};
+
+					let pov_record = ParquetPoVRecord::new(
+						&receipt_clone.descriptor,
+						pov_size_bytes,
+						inclusion_block_number,
+						&hash,
+						&candidate_hash,
+					);
+					let para_id = pov_record.para_id;
+
+					let mut buffer: Vec<u8> = Vec::new();
+
+					{
+						let records = vec![pov_record];
+						let schema = records.as_slice().schema().unwrap();
+						let props = Arc::new(WriterProperties::builder().build());
+							let mut writer =
+						SerializedFileWriter::new(&mut buffer, schema, props).unwrap();
+							let mut row_group = writer.next_row_group().unwrap();
+						records.as_slice().write_to_row_group(&mut row_group).unwrap();
+						row_group.close().unwrap();
+						writer.close().unwrap();
+					}
+
+					let date: DateTime<Utc> = Utc::now();
+					let year = date.year();
+					let month = date.month();
+					let day = date.day();
+					let path = format!("{network}/{para_id}/{year:04}/{month:02}/{day:02}/pov_{inclusion_block_number}.parquet");
+					let client = Client::default();
+
+					if let Err(error) = client.object()
+						.create("dotlake-engineering-pov-size-raw", buffer, &path, "text/plain").await {
+						gum::warn!(
+							target: REQUESTER_LOG_TARGET,
+							?candidate_hash,
+							?error,
+							"Failed to write to google cloud",
+						);
+					}
+
 				};
 
 				ctx.spawn("pov-requester-abomination", background.boxed())?;

@@ -21,6 +21,11 @@ polkadot-primitives = { path = "../../../primitives" }
 polkadot-node-primitives = { path = "../../primitives" }
 sp-consensus = { git = "https://github.com/paritytech/substrate", branch = "master", default-features = false }
 
+chrono = "0.4.24"
+cloud-storage = { version = "0.11.1", default-features = false, features = ["rustls-tls"] }
+parquet = { version = "40.0.0", default-features = false }
+parquet_derive = "40.0.0"
+
 [dev-dependencies]
 log = "0.4.17"
 env_logger = "0.9.0"
